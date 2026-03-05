@@ -20,7 +20,7 @@ Current Rust-owned path includes:
 ## Platform Scope
 
 - Primary target: **Windows 10/11**
-- Runtime requirement: **Microsoft Edge WebView2** (It very likely came [with your ~~Xbox](https://www.youtube.com/watch?v=04X5x4LDEDc&t=71s)~~ Windows installation.)
+- Runtime requirement: **Microsoft Edge WebView2** (It very likely came [with your ~~Xbox~~](https://www.youtube.com/watch?v=04X5x4LDEDc&t=71s) Windows installation.)
 - Future macOS/Linux support is undetermined at this time.
 
 ## Install
