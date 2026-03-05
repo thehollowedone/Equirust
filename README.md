@@ -1,8 +1,8 @@
 # Equirust
 
-[forthebadge](https://forthebadge.com)
-[forthebadge](https://forthebadge.com)
-[forthebadge](https://forthebadge.com)
+[![forthebadge](https://forthebadge.com/images/badges/made-with-rust.svg)](https://forthebadge.com)
+[![forthebadge](https://forthebadge.com/images/badges/open-source.svg)](https://forthebadge.com)
+[![forthebadge](https://forthebadge.com/images/badges/fuck-it-ship-it.svg)](https://forthebadge.com)
 
 Rust-first desktop host for Discord + Equicord runtime.
 
