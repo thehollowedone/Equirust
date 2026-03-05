@@ -10,51 +10,33 @@ permissions:
     contents: write
 
 jobs:
-    release:
-        runs-on: ${{ matrix.os }}
-
-        strategy:
-            matrix:
-                os: [macos-latest, ubuntu-latest, windows-latest]
-                include:
-                    - os: macos-latest
-                      platform: mac
-                    - os: ubuntu-latest
-                      platform: linux
-                    - os: windows-latest
-                      platform: windows
+    release-windows:
+        runs-on: windows-latest
 
         steps:
             - uses: actions/checkout@v4
-            - uses: oven-sh/setup-bun@v2
 
-            - name: Install system dependencies
-              if: ${{ matrix.platform == 'linux' }}
-              run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: rustfmt
 
-            - name: Install dependencies
-              run: bun install
+            - name: Cache cargo artifacts
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: |
+                      . -> target
 
-            - name: Build
-              run: bun run build
+            - name: Install Tauri CLI
+              run: cargo install tauri-cli --version "^2"
 
-            - name: Run Electron Builder
-              if: ${{ matrix.platform != 'mac' }}
-              run: |
-                  bun run electron-builder --${{ matrix.platform }} --publish always
-              env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - name: Build release bundles
+              run: cargo tauri build
 
-            - name: Run Electron Builder
-              if: ${{ matrix.platform == 'mac' }}
-              run: |
-                  echo "$API_KEY" > apple.p8
-                  bun run electron-builder --${{ matrix.platform }} --publish always
-              env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  CSC_LINK: ${{ secrets.APPLE_SIGNING_CERT }}
-                  CSC_KEY_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
-                  API_KEY: ${{ secrets.APPLE_API_KEY }}
-                  APPLE_API_KEY: apple.p8
-                  APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-                  APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+            - name: Upload release bundles
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: |
+                      target/release/bundle/**/*.msi
+                      target/release/bundle/**/*.exe
+                      target/release/bundle/**/*.zip

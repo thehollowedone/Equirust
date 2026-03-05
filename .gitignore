@@ -1,7 +1,12 @@
-dist
-node_modules
+# Local environment / editor state
 .env
+.env.*
+!.env.example
 .DS_Store
 .idea/
-.zed
-resources
+.zed/
+
+# Rust / Tauri build artifacts
+target/
+**/target/
+src-tauri/gen/
