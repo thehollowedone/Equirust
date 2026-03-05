@@ -14,7 +14,7 @@ Current Rust-owned path includes:
 
 - Windowing, tray, startup, protocol handling, updater, and persisted state.
 - Native Rich Presence bridge / Discord IPC behavior.
-- Native Windows screen-share picker/session transport.
+- Native Windows screen-share picker/session transport (WIP)
 - Managed Equicord runtime download, cache, version check, and update flow.
 
 ## Platform Scope
