@@ -275,7 +275,8 @@ mod tests {
 
     #[test]
     fn redacts_sensitive_assignments() {
-        let sanitized = sanitize_text_for_log("apiKey=abc123 token:xyz Authorization:Bearer qwerty");
+        let sanitized =
+            sanitize_text_for_log("apiKey=abc123 token:xyz Authorization:Bearer qwerty");
         assert!(sanitized.contains("apiKey=<redacted>"));
         assert!(sanitized.contains("token:<redacted>"));
         assert!(sanitized.contains("Authorization:<redacted>"));

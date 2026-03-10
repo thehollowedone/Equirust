@@ -1,12 +1,12 @@
 use crate::{
-    discord, privacy,
+    mod_runtime, privacy,
     settings::UpdaterState,
     store::{PersistedStore, StoreSnapshot},
-    vencord,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
@@ -21,12 +21,18 @@ const DEFAULT_HOST_RELEASES_API_URL: &str =
 const DEFAULT_HOST_RELEASES_PAGE_URL: &str = "https://github.com/thehollowedone/equirust/releases";
 const HOST_RELEASES_API_URL: Option<&str> = option_env!("EQUIRUST_HOST_RELEASES_API_URL");
 const HOST_RELEASES_PAGE_URL: Option<&str> = option_env!("EQUIRUST_HOST_RELEASES_PAGE_URL");
+const HOST_RELEASE_OWNER: &str = "thehollowedone";
+const HOST_RELEASE_REPO: &str = "equirust";
 const RUNTIME_RELEASES_API_URL: &str =
     "https://api.github.com/repos/Equicord/Equicord/releases/latest";
 const RUNTIME_RELEASES_PAGE_URL: &str = "https://github.com/Equicord/Equicord/releases/latest";
-const RUNTIME_DOWNLOAD_ASSET_NAMES: &[&str] =
-    &["renderer.js", "renderer.css", "patcher.js", "preload.js"];
 const SNOOZE_MILLIS: i64 = 24 * 60 * 60 * 1000;
+const TRUSTED_GITHUB_DOWNLOAD_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
 const LINKED_RUNTIME_PACKAGE_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../runtime-package.json"
@@ -94,6 +100,7 @@ struct GithubRelease {
 struct GithubAsset {
     name: String,
     browser_download_url: String,
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,46 +116,117 @@ struct ReleaseSource {
 }
 
 #[tauri::command]
-pub fn get_host_update_status(
+pub async fn get_host_update_status(
     app: AppHandle,
     store: TauriState<'_, PersistedStore>,
 ) -> Result<UpdateStatus, String> {
-    Ok(resolve_status(UpdateTrack::Host, &app, &store.snapshot()))
+    let snapshot = store.snapshot();
+    tauri::async_runtime::spawn_blocking(move || resolve_status(UpdateTrack::Host, &app, &snapshot))
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn get_runtime_update_status(
+pub async fn get_runtime_update_status(
     app: AppHandle,
     store: TauriState<'_, PersistedStore>,
 ) -> Result<UpdateStatus, String> {
-    Ok(resolve_status(
-        UpdateTrack::Runtime,
-        &app,
-        &store.snapshot(),
-    ))
+    let snapshot = store.snapshot();
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_status(UpdateTrack::Runtime, &app, &snapshot)
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn open_host_update(
+pub async fn open_host_update(
     app: AppHandle,
     store: TauriState<'_, PersistedStore>,
 ) -> Result<(), String> {
-    open_update_target(UpdateTrack::Host, &app, &store.snapshot())
+    let snapshot = store.snapshot();
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        resolve_open_update_target(UpdateTrack::Host, &app, &snapshot)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    webbrowser::open(&target)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn open_runtime_update(
+pub async fn open_runtime_update(
     app: AppHandle,
     store: TauriState<'_, PersistedStore>,
 ) -> Result<(), String> {
-    open_update_target(UpdateTrack::Runtime, &app, &store.snapshot())
+    let snapshot = store.snapshot();
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        resolve_open_update_target(UpdateTrack::Runtime, &app, &snapshot)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    webbrowser::open(&target)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn install_runtime_update(app: AppHandle) -> Result<(), String> {
-    vencord::refresh_managed_runtime(&app).map_err(|err| err.to_string())?;
-    log::info!("Installed managed Equicord runtime update; restarting Equirust");
-    app.restart();
+pub async fn install_runtime_update(app: AppHandle) -> Result<(), String> {
+    let app_for_blocking = app.clone();
+    let should_restart = tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        let snapshot = app_for_blocking.state::<PersistedStore>().snapshot();
+        let status = resolve_status(UpdateTrack::Runtime, &app_for_blocking, &snapshot);
+        if !status.update_available {
+            log::info!(
+                "Runtime update request ignored; no newer release current={} latest={}",
+                status.current_version,
+                status.latest_version.as_deref().unwrap_or("unknown")
+            );
+            return Ok(false);
+        }
+
+        let current_version_before = detect_runtime_version(&app_for_blocking);
+        let runtime_dir =
+            mod_runtime::refresh_managed_runtime(&app_for_blocking)
+                .map_err(|err| err.to_string())?;
+        let current_version_after = detect_runtime_version(&app_for_blocking);
+
+        if let Some(latest_version) = status.latest_version.as_deref() {
+            if current_version_after.trim() != latest_version.trim() {
+                log::warn!(
+                    "Managed runtime refresh version mismatch current_after={} latest={} dir={}; skipping restart",
+                    current_version_after,
+                    latest_version,
+                    runtime_dir.display()
+                );
+                return Ok(false);
+            }
+        }
+
+        if current_version_before == current_version_after {
+            log::info!(
+                "Managed runtime refresh completed without version change version={} dir={}; skipping restart",
+                current_version_after,
+                runtime_dir.display()
+            );
+            return Ok(false);
+        }
+
+        log::info!(
+            "Installed managed Equicord runtime update {} -> {}; restarting Equirust",
+            current_version_before,
+            current_version_after
+        );
+        Ok(true)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+
+    if should_restart {
+        app.restart();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -159,7 +237,7 @@ pub fn get_host_update_download_state(
 }
 
 #[tauri::command]
-pub fn install_host_update(
+pub async fn install_host_update(
     app: AppHandle,
     runtime_state: TauriState<'_, RuntimeState>,
 ) -> Result<(), String> {
@@ -167,9 +245,15 @@ pub fn install_host_update(
     let api_url = source
         .api_url
         .ok_or_else(|| "Equirust host updates are not configured yet".to_owned())?;
-    let release = fetch_latest_release(api_url)?;
-    let asset = select_download_asset(&release.assets)
-        .ok_or_else(|| "No compatible downloadable asset was found for this platform".to_owned())?;
+    let api_url = api_url.to_owned();
+    let asset = tauri::async_runtime::spawn_blocking(move || -> Result<GithubAsset, String> {
+        let release = fetch_latest_release(&api_url)?;
+        select_download_asset(&release.assets).ok_or_else(|| {
+            "No compatible downloadable asset was found for this platform".to_owned()
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())??;
     let download_dir = app
         .path()
         .app_cache_dir()
@@ -273,11 +357,11 @@ fn ignore_update(
     Ok(resolve_status(track, app, &store.snapshot()))
 }
 
-fn open_update_target(
+fn resolve_open_update_target(
     track: UpdateTrack,
     app: &AppHandle,
     snapshot: &StoreSnapshot,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let status = resolve_status(track, app, snapshot);
     let target = match track {
         UpdateTrack::Host => status
@@ -294,9 +378,7 @@ fn open_update_target(
         UpdateTrack::Runtime => "No Equicord runtime release link is available".to_owned(),
     })?;
 
-    webbrowser::open(target)
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    Ok(target.to_owned())
 }
 
 fn resolve_status(track: UpdateTrack, app: &AppHandle, snapshot: &StoreSnapshot) -> UpdateStatus {
@@ -391,9 +473,10 @@ fn fetch_track_release(
     };
     let download_url = match track {
         UpdateTrack::Host => select_download_url(&release.assets),
-        UpdateTrack::Runtime => {
-            select_named_asset_url(&release.assets, RUNTIME_DOWNLOAD_ASSET_NAMES)
-        }
+        UpdateTrack::Runtime => select_named_asset_url(
+            &release.assets,
+            mod_runtime::managed_runtime_required_asset_names(),
+        ),
     };
 
     Ok((release, latest_version, download_url))
@@ -407,15 +490,15 @@ fn current_version_for(track: UpdateTrack, app: &AppHandle) -> String {
 }
 
 fn fetch_runtime_release_version(release: &GithubRelease) -> Result<Option<String>, String> {
-    if let Some(version) = normalize_version_string(&release.tag_name) {
-        return Ok(Some(version));
+    if let Some(renderer_asset) = select_named_asset(&release.assets, &["renderer.js"]) {
+        if let Ok(build) = read_renderer_build_from_url(&renderer_asset.browser_download_url) {
+            if !build.trim().is_empty() {
+                return Ok(Some(build));
+            }
+        }
     }
 
-    let Some(renderer_asset) = select_named_asset(&release.assets, &["renderer.js"]) else {
-        return Ok(None);
-    };
-
-    read_renderer_build_from_url(&renderer_asset.browser_download_url).map(Some)
+    Ok(normalize_version_string(&release.tag_name))
 }
 
 fn detect_runtime_version(app: &AppHandle) -> String {
@@ -426,7 +509,7 @@ fn detect_runtime_version(app: &AppHandle) -> String {
 }
 
 fn runtime_dir_package_version(app: &AppHandle) -> Option<String> {
-    let runtime_dir = vencord::resolve_runtime_dir(Some(app)).ok()?;
+    let runtime_dir = mod_runtime::resolve_runtime_dir(Some(app)).ok()?;
 
     [runtime_dir.join("package.json")]
         .into_iter()
@@ -434,7 +517,7 @@ fn runtime_dir_package_version(app: &AppHandle) -> Option<String> {
 }
 
 fn runtime_renderer_build(app: &AppHandle) -> Option<String> {
-    let runtime_dir = vencord::resolve_runtime_dir(Some(app)).ok()?;
+    let runtime_dir = mod_runtime::resolve_runtime_dir(Some(app)).ok()?;
 
     ["equibopRenderer.js", "renderer.js"]
         .into_iter()
@@ -479,7 +562,7 @@ fn read_renderer_build_from_url(url: &str) -> Result<String, String> {
         .get(url)
         .header(
             reqwest::header::USER_AGENT,
-            discord::standard_http_user_agent(),
+            crate::browser_runtime::standard_http_user_agent(),
         )
         .send()
         .and_then(|response| response.error_for_status())
@@ -533,7 +616,7 @@ fn fetch_latest_release(api_url: &str) -> Result<GithubRelease, String> {
         .get(api_url)
         .header(
             reqwest::header::USER_AGENT,
-            discord::standard_http_user_agent(),
+            crate::browser_runtime::standard_http_user_agent(),
         )
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
@@ -543,6 +626,64 @@ fn fetch_latest_release(api_url: &str) -> Result<GithubRelease, String> {
         .map_err(|err| err.to_string())
 }
 
+fn is_trusted_release_download_url(url: &str, owner: &str, repo: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host != "github.com" {
+        return false;
+    }
+
+    parsed
+        .path()
+        .starts_with(&format!("/{owner}/{repo}/releases/download/"))
+}
+
+fn is_trusted_release_response_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    TRUSTED_GITHUB_DOWNLOAD_HOSTS
+        .iter()
+        .any(|entry| host.eq_ignore_ascii_case(entry))
+}
+
+fn expected_asset_sha256(asset: &GithubAsset) -> Result<&str, String> {
+    let digest = asset
+        .digest
+        .as_deref()
+        .ok_or_else(|| format!("Release asset is missing a SHA-256 digest: {}", asset.name))?;
+    let digest = digest
+        .strip_prefix("sha256:")
+        .or_else(|| digest.strip_prefix("SHA256:"))
+        .ok_or_else(|| format!("Release asset digest is not SHA-256: {}", asset.name))?;
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Release asset digest is malformed for {}",
+            asset.name
+        ));
+    }
+    Ok(digest)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 fn build_client(
     connect_timeout: Duration,
     timeout: Duration,
@@ -550,7 +691,7 @@ fn build_client(
     reqwest::blocking::Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(timeout)
-        .user_agent(discord::standard_http_user_agent())
+        .user_agent(crate::browser_runtime::standard_http_user_agent())
         .build()
         .map_err(|err| err.to_string())
 }
@@ -675,6 +816,18 @@ fn download_and_launch_update(
     asset: &GithubAsset,
     target_path: &Path,
 ) -> Result<(), String> {
+    if !is_trusted_release_download_url(
+        &asset.browser_download_url,
+        HOST_RELEASE_OWNER,
+        HOST_RELEASE_REPO,
+    ) {
+        return Err(format!(
+            "Updater rejected an untrusted download URL for {}",
+            asset.name
+        ));
+    }
+    let expected_digest = expected_asset_sha256(asset)?.to_owned();
+
     fs::create_dir_all(
         target_path
             .parent()
@@ -687,14 +840,23 @@ fn download_and_launch_update(
         .get(&asset.browser_download_url)
         .header(
             reqwest::header::USER_AGENT,
-            discord::standard_http_user_agent(),
+            crate::browser_runtime::standard_http_user_agent(),
         )
         .send()
         .and_then(|response| response.error_for_status())
         .map_err(|err| err.to_string())?;
+    if !is_trusted_release_response_url(response.url()) {
+        return Err(format!(
+            "Updater rejected an unexpected release download host for {}",
+            asset.name
+        ));
+    }
 
     let total = response.content_length().unwrap_or_default();
-    let mut file = File::create(target_path).map_err(|err| err.to_string())?;
+    let temp_path = target_path.with_extension("part");
+    let _ = fs::remove_file(&temp_path);
+    let mut file = File::create(&temp_path).map_err(|err| err.to_string())?;
+    let mut hasher = Sha256::new();
     let mut downloaded = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
 
@@ -706,6 +868,7 @@ fn download_and_launch_update(
 
         file.write_all(&buffer[..read])
             .map_err(|err| err.to_string())?;
+        hasher.update(&buffer[..read]);
         downloaded = downloaded.saturating_add(read as u64);
 
         let percent = if total > 0 {
@@ -715,6 +878,21 @@ fn download_and_launch_update(
         };
         runtime_state.set_progress("downloading", percent.min(100.0));
     }
+    drop(file);
+
+    let actual_digest = hex_lower(&hasher.finalize());
+    if !actual_digest.eq_ignore_ascii_case(&expected_digest) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "Updater digest verification failed for {}",
+            asset.name
+        ));
+    }
+
+    if target_path.exists() {
+        let _ = fs::remove_file(target_path);
+    }
+    fs::rename(&temp_path, target_path).map_err(|err| err.to_string())?;
 
     runtime_state.set_progress("launching", 100.0);
     launch_installer(target_path)?;
@@ -730,10 +908,22 @@ fn download_and_launch_update(
 fn launch_installer(target_path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &target_path.display().to_string()])
-            .spawn()
-            .map_err(|err| err.to_string())?;
+        let extension = target_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase());
+
+        if extension.as_deref() == Some("msi") {
+            std::process::Command::new("msiexec")
+                .arg("/i")
+                .arg(target_path)
+                .spawn()
+                .map_err(|err| err.to_string())?;
+        } else {
+            std::process::Command::new(target_path)
+                .spawn()
+                .map_err(|err| err.to_string())?;
+        }
         return Ok(());
     }
 
@@ -757,4 +947,51 @@ fn launch_installer(target_path: &Path) -> Result<(), String> {
 
     #[allow(unreachable_code)]
     Err("Updater install launching is unsupported on this platform".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_renderer_build_line, select_named_asset_url, GithubAsset};
+
+    #[test]
+    fn parses_renderer_build_banner() {
+        assert_eq!(
+            parse_renderer_build_line("// Equicord 1.2.3"),
+            Some("1.2.3".to_owned())
+        );
+        assert_eq!(
+            parse_renderer_build_line("// Vencord nightly-abc"),
+            Some("nightly-abc".to_owned())
+        );
+        assert_eq!(parse_renderer_build_line("console.log('no banner');"), None);
+    }
+
+    #[test]
+    fn selects_runtime_assets_from_centralized_contract() {
+        let assets = vec![
+            GithubAsset {
+                name: "renderer.js".to_owned(),
+                browser_download_url:
+                    "https://github.com/Equicord/Equicord/releases/download/v1/renderer.js"
+                        .to_owned(),
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+            },
+            GithubAsset {
+                name: "renderer.css".to_owned(),
+                browser_download_url:
+                    "https://github.com/Equicord/Equicord/releases/download/v1/renderer.css"
+                        .to_owned(),
+                digest: Some(format!("sha256:{}", "b".repeat(64))),
+            },
+        ];
+
+        let selected = select_named_asset_url(
+            &assets,
+            crate::mod_runtime::managed_runtime_required_asset_names(),
+        );
+        assert_eq!(
+            selected.as_deref(),
+            Some("https://github.com/Equicord/Equicord/releases/download/v1/renderer.js")
+        );
+    }
 }

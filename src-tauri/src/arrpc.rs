@@ -1,4 +1,4 @@
-use crate::{discord, paths::AppPaths, privacy, settings::Settings};
+use crate::{paths::AppPaths, privacy, processes, settings::Settings};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,7 +20,6 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime, State as TauriState};
 use tungstenite::{connect, error::Error as WsError, stream::MaybeTlsStream, Message, WebSocket};
-use xcap::Window;
 
 #[cfg(target_os = "windows")]
 use {
@@ -35,12 +34,15 @@ const STATUS_EVENT: &str = "equirust:arrpc-status";
 const STATE_FILE_PREFIX: &str = "arrpc-state-";
 const STATE_FILE_STALE_MS: i64 = 60_000;
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
-const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(350);
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SUPERVISOR_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1200);
+const SUPERVISOR_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_RECONNECT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_WS_HOST: &str = "127.0.0.1";
 const DEFAULT_BRIDGE_PORT: u16 = 60_000;
-const PROCESS_SCAN_INTERVAL: Duration = Duration::from_secs(1);
-const PROCESS_CLEAR_GRACE: Duration = Duration::from_secs(4);
+const PROCESS_SCAN_INTERVAL: Duration = Duration::from_millis(500);
+const PROCESS_CLEAR_GRACE: Duration = Duration::from_secs(2);
+const EXTERNAL_ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const DETECTABLE_APPS_URL: &str = "https://discord.com/api/v9/applications/detectable";
 
 #[cfg(target_os = "windows")]
@@ -267,6 +269,8 @@ fn supervisor_loop<R: Runtime>(app: AppHandle<R>, generation: u64, settings: Set
     let mut ready_at: Option<Instant> = None;
     let init_started_at = Instant::now();
     let mut native_detector = native_process_scanning.then(NativeProcessDetector::new);
+    let mut active_pids = HashSet::new();
+    let mut next_external_activity_refresh = Instant::now();
 
     start_native_rpc_bridge(&app, generation);
 
@@ -405,8 +409,26 @@ fn supervisor_loop<R: Runtime>(app: AppHandle<R>, generation: u64, settings: Set
             .as_ref()
             .map(|found| !found.stale && !found.content.activities.is_empty())
             .unwrap_or(false);
-        let active_pids: HashSet<u32> = enumerate_processes().into_iter().map(|process| process.pid).collect();
-        let native_override_active = refresh_external_rpc_activity_state(&app, &active_pids);
+        let has_external_rpc_entries = app
+            .state::<RuntimeState>()
+            .inner
+            .lock()
+            .ok()
+            .map(|inner| !inner.external_rpc_activities.is_empty())
+            .unwrap_or(false);
+        let native_override_active = if has_external_rpc_entries {
+            if next_external_activity_refresh <= Instant::now() {
+                active_pids = enumerate_processes()
+                    .into_iter()
+                    .map(|process| process.pid)
+                    .collect();
+                next_external_activity_refresh =
+                    Instant::now() + EXTERNAL_ACTIVITY_REFRESH_INTERVAL;
+            }
+            refresh_external_rpc_activity_state(&app, &active_pids)
+        } else {
+            false
+        };
         if let Some(detector) = native_detector.as_mut() {
             let detection = detector.poll();
             if !external_has_activity && !native_override_active {
@@ -537,7 +559,22 @@ fn supervisor_loop<R: Runtime>(app: AppHandle<R>, generation: u64, settings: Set
             }
         }
 
-        thread::sleep(SUPERVISOR_POLL_INTERVAL);
+        let sleep_interval = if websocket.is_some()
+            || child_snapshot.running.is_some()
+            || external_has_activity
+            || native_override_active
+            || native_detector
+                .as_ref()
+                .and_then(|detector| detector.current.as_ref())
+                .is_some()
+        {
+            SUPERVISOR_POLL_INTERVAL
+        } else if launched_child || builtin_enabled || custom_ws.is_some() {
+            SUPERVISOR_BACKGROUND_POLL_INTERVAL
+        } else {
+            SUPERVISOR_IDLE_POLL_INTERVAL
+        };
+        thread::sleep(sleep_interval);
     }
 
     if websocket.is_some() {
@@ -559,7 +596,7 @@ fn native_builtin_backend(settings: &Settings) -> bool {
 }
 
 fn arrpc_debug_logging_enabled(settings: &Settings) -> bool {
-    cfg!(debug_assertions) && settings.ar_rpc_debug.unwrap_or(false)
+    settings.debug_standard_diagnostics_enabled()
 }
 
 fn custom_websocket_endpoint(settings: &Settings) -> Option<(String, u16)> {
@@ -650,13 +687,14 @@ fn start_builtin_process<R: Runtime>(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = command.spawn().map_err(|err| {
-        format!(
-            "Failed to start arRPC backend at {}: {}",
-            binary_path.display(),
-            err
-        )
-    })?;
+    let mut child =
+        processes::spawn_managed_child(app, &mut command, "arrpc-backend").map_err(|err| {
+            format!(
+                "Failed to start arRPC backend at {}: {}",
+                binary_path.display(),
+                err
+            )
+        })?;
     spawn_child_output_drainers(app, generation, &mut child);
 
     {
@@ -798,8 +836,10 @@ fn system_binary_candidates(asset_name: &str) -> Vec<PathBuf> {
 
 fn download_release_binary(asset_name: &str, destination: &Path) -> Result<(), String> {
     let _ = (asset_name, destination);
-    Err("External arRPC backend downloads are disabled. Equirust now uses native Rust arRPC only."
-        .to_owned())
+    Err(
+        "External arRPC backend downloads are disabled. Equirust now uses native Rust arRPC only."
+            .to_owned(),
+    )
 }
 
 fn platform_asset_name() -> Result<&'static str, String> {
@@ -1289,7 +1329,7 @@ impl NativeProcessDetector {
 
         self.next_scan_at_ms = now.saturating_add(PROCESS_SCAN_INTERVAL.as_millis() as i64);
         let processes = enumerate_processes();
-        let visible_windows = visible_windows_by_pid();
+        let visible_windows = visible_windows_by_pid(&processes);
         let detected = processes
             .iter()
             .find_map(|process| self.match_process(process, now, &visible_windows));
@@ -1652,7 +1692,7 @@ fn extract_vdf_line_value(line: &str, key: &str) -> Option<String> {
 fn fetch_detectable_index() -> DetectableIndex {
     let client = match Client::builder()
         .timeout(Duration::from_secs(8))
-        .user_agent(discord::standard_http_user_agent())
+        .user_agent(crate::browser_runtime::standard_http_user_agent())
         .build()
     {
         Ok(client) => client,
@@ -1775,30 +1815,85 @@ fn windows_path_starts_with(path: &Path, base: &Path) -> bool {
     }
 }
 
-fn visible_windows_by_pid() -> HashMap<u32, Vec<VisibleWindowInfo>> {
-    Window::all()
-        .map(|windows| {
-            let mut by_pid = HashMap::<u32, Vec<VisibleWindowInfo>>::new();
+#[cfg(target_os = "windows")]
+fn visible_windows_by_pid(processes: &[RunningProcess]) -> HashMap<u32, Vec<VisibleWindowInfo>> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible,
+    };
 
-            for window in windows {
-                let Some(pid) = window.pid().ok() else {
-                    continue;
-                };
-                let title = window.title().ok().unwrap_or_default();
-                let app_name = window.app_name().ok().unwrap_or_default();
-                let minimized = window.is_minimized().ok().unwrap_or(false);
-                if minimized || (title.trim().is_empty() && app_name.trim().is_empty()) {
-                    continue;
-                }
-                by_pid
-                    .entry(pid)
-                    .or_default()
-                    .push(VisibleWindowInfo { title, app_name });
-            }
+    struct EnumContext<'a> {
+        by_pid: &'a mut HashMap<u32, Vec<VisibleWindowInfo>>,
+        process_names: HashMap<u32, String>,
+    }
 
-            by_pid
-        })
-        .unwrap_or_default()
+    unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let context = &mut *(lparam.0 as *mut EnumContext<'_>);
+
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return BOOL(1);
+        }
+
+        let text_length = GetWindowTextLengthW(hwnd);
+        if text_length <= 0 {
+            return BOOL(1);
+        }
+
+        let mut title_buffer = vec![0_u16; text_length as usize + 1];
+        let copied = GetWindowTextW(hwnd, &mut title_buffer);
+        if copied <= 0 {
+            return BOOL(1);
+        }
+
+        let title = String::from_utf16_lossy(&title_buffer[..copied as usize])
+            .trim()
+            .to_owned();
+        if title.is_empty() {
+            return BOOL(1);
+        }
+
+        let mut pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return BOOL(1);
+        }
+
+        let app_name = context.process_names.get(&pid).cloned().unwrap_or_default();
+
+        context
+            .by_pid
+            .entry(pid)
+            .or_default()
+            .push(VisibleWindowInfo { title, app_name });
+
+        BOOL(1)
+    }
+
+    let process_names = processes
+        .iter()
+        .map(|process| (process.pid, process.exe_name.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut by_pid = HashMap::<u32, Vec<VisibleWindowInfo>>::new();
+    let mut context = EnumContext {
+        by_pid: &mut by_pid,
+        process_names,
+    };
+
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_windows_callback),
+            LPARAM((&mut context as *mut EnumContext<'_>) as isize),
+        );
+    }
+
+    by_pid
+}
+
+#[cfg(not(target_os = "windows"))]
+fn visible_windows_by_pid(_processes: &[RunningProcess]) -> HashMap<u32, Vec<VisibleWindowInfo>> {
+    HashMap::new()
 }
 
 fn has_eligible_game_window(windows: &[VisibleWindowInfo], display_name: &str) -> bool {

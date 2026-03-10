@@ -1,3 +1,4 @@
+use crate::browser_runtime;
 use arboard::{Clipboard, ImageData};
 use serde::Serialize;
 use std::{borrow::Cow, collections::BTreeMap, io};
@@ -35,11 +36,7 @@ pub fn get_system_theme_values() -> Result<SystemThemeValues, String> {
 
 #[tauri::command]
 pub fn open_debug_page(target: String) -> Result<(), String> {
-    let (primary_url, fallback_url) = match target.as_str() {
-        "gpu" => ("edge://gpu", "chrome://gpu"),
-        "webrtc-internals" => ("edge://webrtc-internals", "chrome://webrtc-internals"),
-        _ => return Err(format!("unsupported debug target: {target}")),
-    };
+    let (primary_url, fallback_url) = browser_runtime::debug_page_targets(&target)?;
 
     open_debug_url(primary_url)
         .or_else(|_| open_debug_url(fallback_url))
@@ -49,8 +46,8 @@ pub fn open_debug_page(target: String) -> Result<(), String> {
 fn open_debug_url(url: &str) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        return std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+        return std::process::Command::new("explorer")
+            .arg(url)
             .spawn()
             .map(|_| ());
     }

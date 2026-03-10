@@ -1,4 +1,4 @@
-use crate::{paths::AppPaths, store::PersistedStore, tray, vencord};
+use crate::{mod_runtime, paths::AppPaths, store::PersistedStore, tray};
 use serde::Serialize;
 use std::{
     fs, io,
@@ -39,7 +39,7 @@ pub fn get_file_manager_state(
     store: State<'_, PersistedStore>,
 ) -> Result<FileManagerState, String> {
     let snapshot = store.snapshot();
-    let runtime_resolution = vencord::resolve_runtime_resolution(Some(&app)).ok();
+    let runtime_resolution = mod_runtime::resolve_runtime_resolution(Some(&app)).ok();
     Ok(FileManagerState {
         using_custom_vencord_dir: snapshot.state.equicord_dir.is_some(),
         custom_vencord_dir: snapshot.state.equicord_dir,
@@ -183,8 +183,8 @@ pub fn resolve_custom_runtime_dir(store: &PersistedStore) -> Option<PathBuf> {
 pub fn open_path(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.display().to_string()])
+        std::process::Command::new("explorer")
+            .arg(path.as_os_str())
             .spawn()?;
         return Ok(());
     }
@@ -228,17 +228,13 @@ fn normalize_custom_vencord_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn normalize_runtime_dir(path: &Path) -> Option<PathBuf> {
-    if path.join("renderer.js").exists() {
+    if mod_runtime::runtime_dir_has_required_assets(path) {
         return Some(path.to_path_buf());
     }
 
     let nested = path.join("equibop");
-    if nested.join("renderer.js").exists() || nested.join("main.js").exists() {
+    if mod_runtime::runtime_dir_has_required_assets(&nested) {
         return Some(nested);
-    }
-
-    if path.join("main.js").exists() {
-        return Some(path.to_path_buf());
     }
 
     None
@@ -273,5 +269,52 @@ fn infer_asset_mime_type(path: &Path) -> &'static str {
         Some("svg") => "image/svg+xml",
         Some("ico") => "image/x-icon",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_runtime_dir;
+    use std::{
+        env, fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        env::temp_dir().join(format!("equirust-{name}-{stamp}"))
+    }
+
+    fn write_runtime_files(dir: &PathBuf) {
+        fs::create_dir_all(dir).expect("create runtime dir");
+        fs::write(dir.join("renderer.js"), "// Equicord test\n").expect("write renderer.js");
+        fs::write(dir.join("renderer.css"), "body{}\n").expect("write renderer.css");
+    }
+
+    #[test]
+    fn normalize_runtime_dir_accepts_direct_runtime_folder() {
+        let dir = unique_temp_dir("custom-runtime-direct");
+        write_runtime_files(&dir);
+
+        let resolved = normalize_runtime_dir(&dir);
+        assert_eq!(resolved.as_deref(), Some(dir.as_path()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn normalize_runtime_dir_accepts_nested_equibop_runtime_folder() {
+        let dir = unique_temp_dir("custom-runtime-nested");
+        let nested = dir.join("equibop");
+        write_runtime_files(&nested);
+
+        let resolved = normalize_runtime_dir(&dir);
+        assert_eq!(resolved.as_deref(), Some(nested.as_path()));
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

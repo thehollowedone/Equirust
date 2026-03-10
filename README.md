@@ -37,6 +37,8 @@ Download from [GitHub Releases](https://github.com/thehollowedone/equirust/relea
 
 Installers do **not** pre-bundle the runtime payload. Equirust downloads and caches it on first run, then reuses/updates it when a newer runtime release is available.
 
+The host consumes the renderer dist (`renderer.js` + `renderer.css`) and optional plugin-manifest files from that cache. Electron `asar` host payloads are not part of the shipped Tauri runtime path.
+
 ## Logs and Crash Logs
 
 Log directory (Windows):
@@ -47,7 +49,7 @@ Files:
 
 - `Equirust.log`: normal runtime log output
 - `Equirust-crash.log`: panic/crash entries (always recorded)
-- `Equirust-debug.log`: extra verbose bridge/runtime diagnostics (debug builds)
+- `Equirust-debug.log`: extra verbose bridge/runtime diagnostics (debug builds and `--profiling-diagnostics` runs)
 
 ## Build
 
@@ -71,6 +73,31 @@ cargo tauri dev
 
 `cargo check --workspace` performs compile/type checks only. It does not produce runnable binaries.
 
+Profiling build:
+
+```sh
+cargo build -p equirust --profile profiling
+```
+
+Use this when recording traces in Windows Performance Recorder, Visual Studio,
+or another native profiler. The `profiling` profile inherits `release`, keeps
+optimizations enabled, preserves symbols, and does not turn `debug_assertions`
+back on. It is meant for measuring near-release behavior, not for shipping.
+
+Artifact:
+
+- Binary: `target/profiling/equirust.exe`
+
+Optional profiling diagnostics:
+
+```sh
+target/profiling/equirust.exe --profiling-diagnostics
+```
+
+That flag enables extra runtime/media diagnostics and more verbose logging for
+investigation, but it does add overhead. Use plain `target/profiling/equirust.exe`
+for cleaner startup, input-latency, and screenshare performance measurements.
+
 Release build:
 
 ```sh
@@ -81,6 +108,8 @@ Artifacts:
 
 - Binary: `target/release/equirust.exe`
 - Bundles/installers: `target/release/bundle/`
+
+Release is the distribution target. Do not ship the `profiling` build.
 
 ## Documentation
 

@@ -1,18 +1,22 @@
 mod app_menu;
 mod arrpc;
 mod autostart;
+mod browser_runtime;
 mod capturer;
 mod csp;
 mod desktop;
+mod desktop_host;
+mod desktop_stream;
 mod discord;
 mod doctor;
 mod file_manager;
 mod http_proxy;
 mod ipc_bridge;
-mod native_capture;
+mod mod_runtime;
 mod notifications;
 mod paths;
 mod privacy;
+mod processes;
 mod protocol;
 mod settings;
 mod spellcheck;
@@ -20,9 +24,9 @@ mod store;
 mod tray;
 mod updater;
 mod utilities;
-mod vencord;
 mod virtmic;
 mod voice;
+mod win32_window_snapshot;
 mod window;
 use std::{
     backtrace::Backtrace,
@@ -43,7 +47,7 @@ fn build_log_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .target(Target::new(TargetKind::LogDir { file_name: None }))
         .timezone_strategy(TimezoneStrategy::UseLocal);
 
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) || browser_runtime::profiling_diagnostics_enabled() {
         builder
             .level(log::LevelFilter::Info)
             .rotation_strategy(RotationStrategy::KeepSome(3))
@@ -97,7 +101,14 @@ fn install_panic_hook<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             };
             let location = info
                 .location()
-                .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
                 .unwrap_or_else(|| "<unknown>".to_owned());
             let thread_name = std::thread::current()
                 .name()
@@ -119,7 +130,7 @@ fn install_panic_hook<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .register_uri_scheme_protocol("vencord", vencord::handle_protocol)
+        .register_uri_scheme_protocol("vencord", mod_runtime::handle_protocol)
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             match voice::handle_second_instance(app, &args) {
@@ -140,7 +151,9 @@ pub fn run() {
             install_panic_hook(app.handle());
             app.manage(arrpc::RuntimeState::default());
             app.manage(notifications::RuntimeState::default());
-            app.manage(native_capture::session::RuntimeState::default());
+            app.manage(desktop_stream::stream_session::RuntimeState::default());
+            app.manage(processes::RuntimeState::default());
+            app.manage(window::WebviewRuntimeState::default());
             app.manage(tray::RuntimeState::default());
             app.manage(updater::RuntimeState::default());
             app.manage(ipc_bridge::RuntimeState::default());
@@ -185,16 +198,17 @@ pub fn run() {
             csp::csp_is_domain_allowed,
             csp::csp_remove_override,
             csp::csp_request_add_override,
-            desktop::app_relaunch,
-            desktop::log_client_runtime,
-            desktop::window_close,
-            desktop::window_focus,
-            desktop::window_is_maximized,
-            desktop::window_minimize,
-            desktop::window_start_dragging,
-            desktop::window_set_title,
-            desktop::window_start_resize_dragging,
-            desktop::window_toggle_maximize,
+            desktop_host::app_relaunch,
+            desktop_host::log_client_runtime,
+            desktop_host::log_client_runtime_batch,
+            desktop_host::window_close,
+            desktop_host::window_focus,
+            desktop_host::window_is_maximized,
+            desktop_host::window_minimize,
+            desktop_host::window_start_dragging,
+            desktop_host::window_set_title,
+            desktop_host::window_start_resize_dragging,
+            desktop_host::window_toggle_maximize,
             doctor::run_doctor,
             discord::get_discord_target,
             discord::launch_discord,
@@ -208,23 +222,27 @@ pub fn run() {
             ipc_bridge::respond_renderer_command,
             notifications::flash_frame,
             notifications::set_badge_count,
-            native_capture::session::get_native_capture_session_state,
-            native_capture::session::get_native_capture_encoder_preview,
-            native_capture::session::start_native_capture_session,
-            native_capture::session::stop_native_capture_session,
-            vencord::get_vencord_renderer_css,
-            vencord::get_vencord_file_state,
-            vencord::get_vencord_quick_css,
-            vencord::get_vencord_theme_data,
-            vencord::get_vencord_themes_list,
-            vencord::delete_vencord_theme,
-            vencord::open_external_link,
-            vencord::open_vencord_quick_css,
-            vencord::open_vencord_settings_folder,
-            vencord::open_vencord_themes_folder,
-            vencord::set_vencord_quick_css,
-            vencord::set_vencord_settings,
-            vencord::upload_vencord_theme,
+            desktop_stream::stream_session::get_desktop_stream_session_state,
+            desktop_stream::stream_session::get_desktop_stream_encoder_preview,
+            desktop_stream::stream_session::start_desktop_stream_session,
+            desktop_stream::stream_session::stop_desktop_stream_session,
+            mod_runtime::get_vencord_renderer_css,
+            mod_runtime::get_vencord_file_state,
+            mod_runtime::get_vencord_quick_css,
+            mod_runtime::get_vencord_theme_entries,
+            mod_runtime::get_vencord_theme_data,
+            mod_runtime::get_vencord_settings_dir,
+            mod_runtime::get_vencord_themes_dir,
+            mod_runtime::get_vencord_themes_list,
+            mod_runtime::delete_vencord_theme,
+            mod_runtime::open_external_link,
+            mod_runtime::open_vencord_quick_css,
+            mod_runtime::open_vencord_settings_folder,
+            mod_runtime::open_vencord_themes_folder,
+            mod_runtime::set_vencord_quick_css,
+            mod_runtime::set_vencord_theme_data,
+            mod_runtime::set_vencord_settings,
+            mod_runtime::upload_vencord_theme,
             spellcheck::check_spelling,
             store::get_store_snapshot,
             store::set_settings,
@@ -252,7 +270,8 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {
-            let message = privacy::sanitize_text_for_log(&format!("error while running Equirust: {err}"));
+            let message =
+                privacy::sanitize_text_for_log(&format!("error while running Equirust: {err}"));
             log::error!("{}", message);
             eprintln!("{}", message);
         });

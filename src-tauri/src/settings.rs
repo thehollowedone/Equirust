@@ -20,7 +20,6 @@ pub enum TransparencyOption {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioSettings {
-    pub workaround: Option<bool>,
     pub device_select: Option<bool>,
     pub granular_select: Option<bool>,
     pub ignore_virtual: Option<bool>,
@@ -40,7 +39,6 @@ impl AudioSettings {
             };
         }
 
-        apply_option_default!(workaround);
         apply_option_default!(device_select);
         apply_option_default!(granular_select);
         apply_option_default!(ignore_virtual);
@@ -80,8 +78,6 @@ pub struct Settings {
     pub ar_rpc: Option<bool>,
     #[serde(alias = "arRPCDisabled")]
     pub ar_rpc_disabled: Option<bool>,
-    #[serde(alias = "arRPCDebug")]
-    pub ar_rpc_debug: Option<bool>,
     #[serde(alias = "arRPCProcessScanning")]
     pub ar_rpc_process_scanning: Option<bool>,
     #[serde(alias = "arRPCBridge")]
@@ -103,7 +99,6 @@ pub struct Settings {
     pub app_badge: Option<bool>,
     pub badge_only_for_mentions: Option<bool>,
     pub enable_taskbar_flashing: Option<bool>,
-    pub runtime_diagnostics: Option<bool>,
     pub disable_min_size: Option<bool>,
     pub click_tray_to_show_hide: Option<bool>,
     pub custom_title_bar: Option<bool>,
@@ -117,6 +112,11 @@ pub struct Settings {
     pub spell_check_languages: Option<Vec<String>>,
     pub spell_check_dictionary: Option<Vec<String>>,
     pub audio: Option<AudioSettings>,
+    #[cfg(debug_assertions)]
+    #[serde(alias = "runtimeDiagnostics", alias = "arRPCDebug")]
+    pub debug_standard_diagnostics: Option<bool>,
+    #[cfg(debug_assertions)]
+    pub debug_media_diagnostics: Option<bool>,
 }
 
 impl Settings {
@@ -133,11 +133,10 @@ impl Settings {
             static_title: Some(false),
             enable_menu: Some(false),
             disable_smooth_scroll: Some(false),
-            hardware_acceleration: Some(true),
-            hardware_video_acceleration: Some(true),
+            hardware_acceleration: Some(false),
+            hardware_video_acceleration: Some(false),
             ar_rpc: Some(true),
             ar_rpc_disabled: Some(false),
-            ar_rpc_debug: Some(false),
             ar_rpc_process_scanning: Some(true),
             ar_rpc_bridge: None,
             ar_rpc_bridge_port: None,
@@ -150,7 +149,6 @@ impl Settings {
             app_badge: Some(true),
             badge_only_for_mentions: Some(true),
             enable_taskbar_flashing: Some(false),
-            runtime_diagnostics: Some(false),
             disable_min_size: Some(false),
             click_tray_to_show_hide: Some(false),
             custom_title_bar: Some(cfg!(target_os = "windows")),
@@ -164,6 +162,10 @@ impl Settings {
             spell_check_languages: None,
             spell_check_dictionary: None,
             audio: Some(AudioSettings::default()),
+            #[cfg(debug_assertions)]
+            debug_standard_diagnostics: Some(true),
+            #[cfg(debug_assertions)]
+            debug_media_diagnostics: Some(true),
         }
     }
 
@@ -191,7 +193,6 @@ impl Settings {
         apply_option_default!(hardware_video_acceleration);
         apply_option_default!(ar_rpc);
         apply_option_default!(ar_rpc_disabled);
-        apply_option_default!(ar_rpc_debug);
         apply_option_default!(ar_rpc_process_scanning);
         apply_option_default!(ar_rpc_bridge);
         apply_option_default!(ar_rpc_bridge_port);
@@ -204,7 +205,6 @@ impl Settings {
         apply_option_default!(app_badge);
         apply_option_default!(badge_only_for_mentions);
         apply_option_default!(enable_taskbar_flashing);
-        apply_option_default!(runtime_diagnostics);
         apply_option_default!(disable_min_size);
         apply_option_default!(click_tray_to_show_hide);
         apply_option_default!(custom_title_bar);
@@ -217,6 +217,10 @@ impl Settings {
         apply_option_default!(csp_overrides);
         apply_option_default!(spell_check_languages);
         apply_option_default!(spell_check_dictionary);
+        #[cfg(debug_assertions)]
+        apply_option_default!(debug_standard_diagnostics);
+        #[cfg(debug_assertions)]
+        apply_option_default!(debug_media_diagnostics);
 
         self.audio = Some(
             self.audio
@@ -226,6 +230,22 @@ impl Settings {
         );
 
         self
+    }
+
+    pub fn debug_standard_diagnostics_enabled(&self) -> bool {
+        if crate::browser_runtime::profiling_diagnostics_enabled() {
+            return true;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            self.debug_standard_diagnostics.unwrap_or(true)
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
     }
 }
 
@@ -251,9 +271,6 @@ pub struct PersistedState {
     pub maximized: Option<bool>,
     pub minimized: Option<bool>,
     pub window_bounds: Option<WindowBounds>,
-    pub first_launch: Option<bool>,
-    pub steam_os_layout_version: Option<u32>,
-    pub linux_auto_start_enabled: Option<bool>,
     pub equicord_dir: Option<String>,
     pub launch_arguments: Option<String>,
     pub host_updater: Option<UpdaterState>,

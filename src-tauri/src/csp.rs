@@ -7,8 +7,33 @@ use tauri::{
 };
 use url::Url;
 
-const DEFAULT_VENCORD_CSP_ORIGIN: &str = "https://api.vencord.dev";
-const DEFAULT_VENCORD_CSP_DIRECTIVES: &[&str] = &["connect-src"];
+struct DefaultCspOverride {
+    origin: &'static str,
+    directives: &'static [&'static str],
+}
+
+const DEFAULT_CSP_OVERRIDES: &[DefaultCspOverride] = &[
+    // Vencord/Equicord API calls
+    DefaultCspOverride {
+        origin: "https://api.vencord.dev",
+        directives: &["connect-src"],
+    },
+    // Vencord/Equicord user badges — badge JSON fetch + badge images
+    DefaultCspOverride {
+        origin: "https://badges.vencord.dev",
+        directives: &["connect-src", "img-src"],
+    },
+    // GitHub user avatars shown on plugin contributor cards
+    DefaultCspOverride {
+        origin: "https://avatars.githubusercontent.com",
+        directives: &["img-src"],
+    },
+    // Raw GitHub content (some plugins load assets from raw.githubusercontent.com)
+    DefaultCspOverride {
+        origin: "https://raw.githubusercontent.com",
+        directives: &["img-src"],
+    },
+];
 
 #[tauri::command]
 pub fn csp_is_domain_allowed(
@@ -231,13 +256,13 @@ fn all_active_overrides(user_overrides: &Option<Vec<CspOverride>>) -> Vec<CspOve
 }
 
 fn default_overrides() -> Vec<CspOverride> {
-    vec![CspOverride {
-        origin: DEFAULT_VENCORD_CSP_ORIGIN.to_owned(),
-        directives: DEFAULT_VENCORD_CSP_DIRECTIVES
-            .iter()
-            .map(|directive| (*directive).to_owned())
-            .collect(),
-    }]
+    DEFAULT_CSP_OVERRIDES
+        .iter()
+        .map(|entry| CspOverride {
+            origin: entry.origin.to_owned(),
+            directives: entry.directives.iter().map(|d| (*d).to_owned()).collect(),
+        })
+        .collect()
 }
 
 fn is_discord_document_request(request: &Request<Vec<u8>>) -> bool {
