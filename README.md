@@ -20,7 +20,7 @@ Current Rust-owned path includes:
 ## Platform Scope
 
 - Primary target: **Windows 10/11**
-- Runtime requirement: **Microsoft Edge WebView2** (It very likely came [with your ~~Xbox](https://www.youtube.com/watch?v=04X5x4LDEDc&t=71s)~~ Windows installation.)
+- Runtime requirement: **Microsoft Edge WebView2** (It very likely came [with your ~~Xbox~~](https://www.youtube.com/watch?v=04X5x4LDEDc&t=71s) Windows installation.)
 - Future macOS/Linux support is undetermined at this time.
 
 ## Install
@@ -29,15 +29,6 @@ Download from [GitHub Releases](https://github.com/thehollowedone/equirust/relea
 
 - `.msi` / setup `.exe` for standard install
 - `.zip` for portable usage
-
-## Runtime Path (Windows)
-
-- Managed Equicord runtime cache:
-`%LOCALAPPDATA%\equirust\equicord-runtime\current`
-
-Installers do **not** pre-bundle the runtime payload. Equirust downloads and caches it on first run, then reuses/updates it when a newer runtime release is available.
-
-The host consumes the renderer dist (`renderer.js` + `renderer.css`) and optional plugin-manifest files from that cache. Electron `asar` host payloads are not part of the shipped Tauri runtime path.
 
 ## Logs and Crash Logs
 
@@ -82,7 +73,7 @@ cargo build -p equirust --profile profiling
 Use this when recording traces in Windows Performance Recorder, Visual Studio,
 or another native profiler. The `profiling` profile inherits `release`, keeps
 optimizations enabled, preserves symbols, and does not turn `debug_assertions`
-back on. It is meant for measuring near-release behavior, not for shipping.
+back on. It is not meant for shipping.
 
 Artifact:
 
@@ -95,8 +86,7 @@ target/profiling/equirust.exe --profiling-diagnostics
 ```
 
 That flag enables extra runtime/media diagnostics and more verbose logging for
-investigation, but it does add overhead. Use plain `target/profiling/equirust.exe`
-for cleaner startup, input-latency, and screenshare performance measurements.
+investigation, but it does add overhead.
 
 Release build:
 
@@ -109,7 +99,6 @@ Artifacts:
 - Binary: `target/release/equirust.exe`
 - Bundles/installers: `target/release/bundle/`
 
-Release is the distribution target. Do not ship the `profiling` build.
 
 ## Documentation
 
